@@ -1231,6 +1231,9 @@ func (p *ConnPool) putConn(ctx context.Context, cn *Conn, freeTurn bool) {
 	}
 
 	if shouldCloseConn {
+		if hookManager := p.hookManager.Load(); hookManager != nil {
+			hookManager.ProcessOnRemove(ctx, cn, nil)
+		}
 		_ = p.closeConn(cn)
 	}
 
@@ -1291,6 +1294,16 @@ func (p *ConnPool) removeConnInternal(ctx context.Context, cn *Conn, reason erro
 //   - reason: why the connection is being closed (use CloseReason* constants)
 //   - fromState: the metric state the connection was in (use MetricState* constants)
 func (p *ConnPool) CloseConn(ctx context.Context, cn *Conn, reason string, fromState string) error {
+	// Mirror removeConnInternal: hooks must run before the connection leaves the pool
+	// so per-connection state (e.g. streaming credentials listeners) is released.
+	if hookManager := p.hookManager.Load(); hookManager != nil {
+		var hookReason error
+		if reason != "" {
+			hookReason = errors.New(reason)
+		}
+		hookManager.ProcessOnRemove(ctx, cn, hookReason)
+	}
+
 	p.removeConnWithLock(cn)
 
 	// Record connection state change: connection is being removed from the specified state
@@ -1380,12 +1393,16 @@ func (p *ConnPool) closed() bool {
 }
 
 func (p *ConnPool) Filter(fn func(*Conn) bool) error {
+	ctx := context.Background()
 	p.connsMu.Lock()
 	defer p.connsMu.Unlock()
 
 	var firstErr error
 	for _, cn := range p.conns {
 		if fn(cn) {
+			if hookManager := p.hookManager.Load(); hookManager != nil {
+				hookManager.ProcessOnRemove(ctx, cn, nil)
+			}
 			if err := p.closeConn(cn); err != nil && firstErr == nil {
 				firstErr = err
 			}
@@ -1399,9 +1416,13 @@ func (p *ConnPool) Close() error {
 		return ErrClosed
 	}
 
+	ctx := context.Background()
 	var firstErr error
 	p.connsMu.Lock()
 	for _, cn := range p.conns {
+		if hookManager := p.hookManager.Load(); hookManager != nil {
+			hookManager.ProcessOnRemove(ctx, cn, ErrClosed)
+		}
 		if err := p.closeConn(cn); err != nil && firstErr == nil {
 			firstErr = err
 		}

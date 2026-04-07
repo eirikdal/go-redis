@@ -135,3 +135,16 @@ func (m *Manager) MarkForReAuth(poolCn *pool.Conn, reAuthFn func(error)) {
 func (m *Manager) RemoveListener(connID uint64) {
 	m.credentialsListeners.Remove(connID)
 }
+
+// DebugCredentialsListenerCount returns the number of entries in the per-connection
+// credentials listener registry. It exists for tests and operational verification
+// (streaming credential lifecycle); it is not a stability-guaranteed public metric API.
+func (m *Manager) DebugCredentialsListenerCount() int {
+	if m == nil || m.credentialsListeners == nil {
+		return 0
+	}
+	cl := m.credentialsListeners
+	cl.lock.RLock()
+	defer cl.lock.RUnlock()
+	return len(cl.listeners)
+}
