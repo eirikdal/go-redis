@@ -397,6 +397,51 @@ func (c *baseClient) wrappedOnClose(newOnClose func() error) func() error {
 	}
 }
 
+// subscribeStreamingCredentials subscribes a per-connection credentials
+// listener for cn on the configured StreamingCredentialsProvider and wires the
+// returned unsubscribe as cn's onClose hook. The initial credentials'
+// basic-auth pair is returned for use in the subsequent HELLO/AUTH handshake.
+//
+// IMPORTANT: this function must NOT mutate baseClient.onClose. An earlier
+// implementation did `c.onClose = c.wrappedOnClose(unsub)` here, which built
+// an unbounded closure chain on the baseClient (one layer per pool connection
+// ever dialed). Each layer captured the per-connection
+// ConnReAuthCredentialsListener, which retains *pool.Conn (and thus its
+// ~64 KiB of bufio read/write buffers plus TLS state). For a long-lived
+// client with normal pool churn (e.g. ConnMaxIdleTime evictions, re-auth
+// error reconnects) this accumulated ~all connections ever dialed on the
+// heap and only unwound on client shutdown, producing a slow memory leak
+// that became visible once streaming credentials providers (e.g. Entra ID)
+// were enabled.
+//
+// Individual connection cleanup is handled entirely via cn.SetOnClose
+// below: when a connection is removed from the pool (eviction, error,
+// re-auth failure) or when the pool itself is closed by
+// ConnPool.Close (which iterates every *Conn in p.conns), each
+// connection's onClose fires and removes its listener from the provider's
+// subscribers. There is no need for a client-level chain.
+func (c *baseClient) subscribeStreamingCredentials(cn *pool.Conn) (string, string, error) {
+	credListener, err := c.streamingCredentialsManager.Listener(
+		cn,
+		c.reAuthConnection(),
+		c.onAuthenticationErr(),
+	)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create credentials listener: %w", err)
+	}
+
+	credentials, unsubscribeFromCredentialsProvider, err := c.opt.StreamingCredentialsProvider.
+		Subscribe(credListener)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to subscribe to streaming credentials: %w", err)
+	}
+
+	cn.SetOnClose(unsubscribeFromCredentialsProvider)
+
+	username, password := credentials.BasicAuth()
+	return username, password, nil
+}
+
 func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 	// This function is called in two scenarios:
 	// 1. First-time init: Connection is in CREATED state (from pool.Get())
@@ -479,27 +524,12 @@ func (c *baseClient) initConn(ctx context.Context, cn *pool.Conn) error {
 
 	username, password := "", ""
 	if c.opt.StreamingCredentialsProvider != nil {
-		credListener, initErr := c.streamingCredentialsManager.Listener(
-			cn,
-			c.reAuthConnection(),
-			c.onAuthenticationErr(),
-		)
-		if initErr != nil {
+		user, pass, err := c.subscribeStreamingCredentials(cn)
+		if err != nil {
 			cn.GetStateMachine().Transition(pool.StateClosed)
-			return fmt.Errorf("failed to create credentials listener: %w", initErr)
+			return err
 		}
-
-		credentials, unsubscribeFromCredentialsProvider, initErr := c.opt.StreamingCredentialsProvider.
-			Subscribe(credListener)
-		if initErr != nil {
-			cn.GetStateMachine().Transition(pool.StateClosed)
-			return fmt.Errorf("failed to subscribe to streaming credentials: %w", initErr)
-		}
-
-		c.onClose = c.wrappedOnClose(unsubscribeFromCredentialsProvider)
-		cn.SetOnClose(unsubscribeFromCredentialsProvider)
-
-		username, password = credentials.BasicAuth()
+		username, password = user, pass
 	} else if c.opt.CredentialsProviderContext != nil {
 		username, password, initErr = c.opt.CredentialsProviderContext(ctx)
 		if initErr != nil {
